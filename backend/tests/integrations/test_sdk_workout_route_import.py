@@ -1,6 +1,7 @@
 """Integration tests for SDK workout route + per-sample ingestion (inbound)."""
 
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -9,8 +10,10 @@ from sqlalchemy.orm import Session
 from app.models import DataPointSeries
 from app.schemas.enums import SeriesType
 from app.schemas.enums.series_types import get_series_type_id
+from app.schemas.model_crud.activities import TimeSeriesQueryParams
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.apple.healthkit.import_service import ImportService
+from app.services.timeseries_service import timeseries_service
 from tests.factories import UserFactory
 
 _WATCH_SOURCE: dict[str, Any] = {
@@ -105,7 +108,7 @@ class TestRouteIngestion:
         lat_rows = _series_rows(db, SeriesType.latitude)
         assert len(lat_rows) == 2
         # DataPointSeries.value is Numeric(10,3): lat/lon are quantized on write
-        # (~55 m worst case). Pre-existing column constraint — see plan Verify section.
+        # (~55 m worst case), which is what the value column's precision allows.
         assert lat_rows[0].value == Decimal("52.230")
         assert len(_series_rows(db, SeriesType.longitude)) == 2
         assert len(_series_rows(db, SeriesType.elevation)) == 1
@@ -146,3 +149,85 @@ class TestWorkoutSampleIngestion:
         hr_rows = _series_rows(db, SeriesType.heart_rate)
         assert [row.value for row in hr_rows] == [Decimal("110.000"), Decimal("112.000")]
         assert len(_series_rows(db, SeriesType.speed)) == 1
+
+
+class TestEndToEnd:
+    def test_samsung_provider_ingests_identically(self, db: Session) -> None:
+        """The route/samples path is provider-agnostic, with no apple branching."""
+        user = UserFactory()
+        service = ImportService(log=logging.getLogger("test"))
+
+        result = service.load_data(db, _payload(provider="samsung"), str(user.id))
+
+        assert result["workouts_saved"] == 1
+        assert result["records_saved"] == 8  # 5 route + 3 samples
+
+    def test_repush_is_idempotent(self, db: Session) -> None:
+        """Re-sending the same workout upserts in place, with no duplicate rows."""
+        user = UserFactory()
+        service = ImportService(log=logging.getLogger("test"))
+
+        service.load_data(db, _payload(), str(user.id))
+        service.load_data(db, _payload(), str(user.id))
+
+        assert len(_series_rows(db, SeriesType.latitude)) == 2
+        assert len(_series_rows(db, SeriesType.heart_rate)) == 2
+
+    def test_backend_read_path_returns_ingested_series(self, db: Session) -> None:
+        """The exact series names PilotAppBackend queries come back from get_timeseries."""
+        user = UserFactory()
+        service = ImportService(log=logging.getLogger("test"))
+        service.load_data(db, _payload(), str(user.id))
+
+        params = TimeSeriesQueryParams(
+            start_datetime=datetime(2026, 7, 29, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 7, 30, tzinfo=timezone.utc),
+            limit=100,
+            cursor=None,
+        )
+        result = timeseries_service.get_timeseries(
+            db,
+            user.id,
+            [SeriesType.heart_rate, SeriesType.latitude, SeriesType.longitude, SeriesType.speed],
+            params,
+        )
+
+        types_returned = {sample.type for sample in result.data}
+        assert types_returned == {
+            SeriesType.heart_rate,
+            SeriesType.latitude,
+            SeriesType.longitude,
+            SeriesType.speed,
+        }
+        assert len(result.data) == 7  # 2 HR + 2 lat + 2 lon + 1 speed
+
+    def test_workout_with_bad_route_point_is_dropped_whole(self, db: Session) -> None:
+        """Drop-&-log (NOT fail-the-batch): a workout with one invalid route point is
+        dropped whole (its workout record AND all its route/HR samples), logged, and
+        reported in result["dropped"] (collection == "workouts"), while the rest of
+        the batch persists and the import reports partial success.
+        Cross-plan (iOS plan, ii-#6): the sync route 202s before this runs in the
+        Celery worker, so 202 does not mean ingested.
+        """
+        user = UserFactory()
+        service = ImportService(log=logging.getLogger("test"))
+        payload = _payload()
+        bad_workout = {
+            **payload["data"]["workouts"][0],
+            "id": "BAD-ROUTE-WORKOUT",
+            # missing latitude → WorkoutRoutePoint (Task 1) validation fails
+            "route": [{"timestamp": "2026-07-29T06:00:01Z", "longitude": 21.012229}],
+        }
+        payload["data"]["workouts"].append(bad_workout)
+
+        result = service.load_data(db, payload, str(user.id))
+
+        assert result["workouts_saved"] == 1  # only the valid workout
+        assert result["records_saved"] == 8  # the valid workout's 5 route + 3 sample rows
+        # the dropped workout contributed NO series rows (its valid HR samples went with it)
+        assert len(_series_rows(db, SeriesType.latitude)) == 2
+        assert len(result["dropped"]) == 1
+        drop = result["dropped"][0]
+        assert drop["collection"] == "workouts"
+        assert drop["index"] == 1
+        assert "latitude" in drop["loc"]
