@@ -32,6 +32,7 @@ from app.schemas.providers.mobile_sdk import (
     SyncRequest as SDKSyncRequest,
 )
 from app.schemas.providers.mobile_sdk import (
+    WorkoutRoutePoint,
     WorkoutStatistic,
 )
 from app.schemas.providers.mobile_sdk.sync_request import (
@@ -165,6 +166,18 @@ class ImportService:
                 original_source_name,
             )
 
+            time_series_samples.extend(
+                self._build_route_samples(
+                    wjson.route,
+                    user_uuid,
+                    device_model,
+                    software_version,
+                    wjson.zoneOffset,
+                    provider,
+                    original_source_name,
+                )
+            )
+
             if duration is None:
                 duration = int((wjson.endDate - wjson.startDate).total_seconds())
 
@@ -198,6 +211,46 @@ class ImportService:
             )
 
             yield record, detail, time_series_samples
+
+    def _build_route_samples(
+        self,
+        route: list[WorkoutRoutePoint] | None,
+        user_uuid: UUID,
+        device_model: str | None,
+        software_version: str | None,
+        zone_offset: str | None,
+        provider: str,
+        source_name: str | None,
+    ) -> list[TimeSeriesSampleCreate]:
+        """Map workouts[].route GPS points to latitude/longitude/elevation samples."""
+        if not route:
+            return []
+        samples: list[TimeSeriesSampleCreate] = []
+        for point in route:
+            values: list[tuple[SeriesType, Decimal]] = [
+                (SeriesType.latitude, Decimal(str(point.latitude))),
+                (SeriesType.longitude, Decimal(str(point.longitude))),
+            ]
+            if point.altitudeM is not None:
+                values.append((SeriesType.elevation, Decimal(str(point.altitudeM))))
+            for series_type, value in values:
+                samples.append(
+                    TimeSeriesSampleCreate(
+                        id=uuid4(),
+                        external_id=None,
+                        user_id=user_uuid,
+                        source=source_name,
+                        device_model=device_model,
+                        software_version=software_version,
+                        provider=provider,
+                        recorded_at=point.timestamp,
+                        zone_offset=zone_offset,
+                        value=value,
+                        series_type=series_type,
+                        is_daily_total=daily_total_flag(series_type, is_daily=False),
+                    )
+                )
+        return samples
 
     def _normalize_unit(self, series_type: SeriesType, value: Decimal, provider: str | None = None) -> Decimal:
         match series_type:
