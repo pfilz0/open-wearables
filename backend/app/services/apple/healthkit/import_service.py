@@ -14,6 +14,7 @@ from app.constants.series_types.sdk import (
     WorkoutStatisticType,
     get_detail_field_from_workout_statistic_type,
     get_series_type_from_metric_type,
+    get_series_type_from_workout_sample_type,
     get_series_type_from_workout_statistic_type,
 )
 from app.constants.workout_types import get_unified_apple_workout_type_sdk
@@ -33,6 +34,7 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.schemas.providers.mobile_sdk import (
     WorkoutRoutePoint,
+    WorkoutSample,
     WorkoutStatistic,
 )
 from app.schemas.providers.mobile_sdk.sync_request import (
@@ -178,6 +180,18 @@ class ImportService:
                 )
             )
 
+            time_series_samples.extend(
+                self._build_workout_sample_series(
+                    wjson.samples,
+                    user_uuid,
+                    device_model,
+                    software_version,
+                    wjson.zoneOffset,
+                    provider,
+                    original_source_name,
+                )
+            )
+
             if duration is None:
                 duration = int((wjson.endDate - wjson.startDate).total_seconds())
 
@@ -251,6 +265,47 @@ class ImportService:
                     )
                 )
         return samples
+
+    def _build_workout_sample_series(
+        self,
+        samples: list[WorkoutSample] | None,
+        user_uuid: UUID,
+        device_model: str | None,
+        software_version: str | None,
+        zone_offset: str | None,
+        provider: str,
+        source_name: str | None,
+    ) -> list[TimeSeriesSampleCreate]:
+        """Map workouts[].samples entries (heartRate, speed, ...) to series samples.
+
+        Unmapped sample types are silently skipped (importer-wide convention).
+        """
+        if not samples:
+            return []
+        result: list[TimeSeriesSampleCreate] = []
+        for sample in samples:
+            series_type = get_series_type_from_workout_sample_type(sample.type)
+            if series_type is None:
+                continue
+            created = TimeSeriesSampleCreate(
+                id=uuid4(),
+                external_id=None,
+                user_id=user_uuid,
+                source=source_name,
+                device_model=device_model,
+                software_version=software_version,
+                provider=provider,
+                recorded_at=sample.timestamp,
+                zone_offset=zone_offset,
+                value=sample.value,
+                series_type=series_type,
+                is_daily_total=daily_total_flag(series_type, is_daily=False),
+            )
+            if series_type == SeriesType.heart_rate:
+                result.append(HeartRateSampleCreate(**created.model_dump()))
+            else:
+                result.append(created)
+        return result
 
     def _normalize_unit(self, series_type: SeriesType, value: Decimal, provider: str | None = None) -> Decimal:
         match series_type:

@@ -119,3 +119,30 @@ class TestRouteIngestion:
         assert result["workouts_saved"] == 1
         assert result["records_saved"] == 0
         assert _series_rows(db, SeriesType.latitude) == []
+
+
+class TestWorkoutSampleIngestion:
+    def test_heart_rate_and_speed_samples_built(self) -> None:
+        service = ImportService(log=logging.getLogger("test"))
+        request = SDKSyncRequest(**_payload(route=False))
+        bundles = list(service._build_workout_bundles(request, "00000000-0000-0000-0000-000000000123"))
+
+        _, _, ts_samples = bundles[0]
+        hr = [s for s in ts_samples if s.series_type == SeriesType.heart_rate]
+        speed = [s for s in ts_samples if s.series_type == SeriesType.speed]
+
+        assert [s.value for s in hr] == [Decimal("110.0"), Decimal("112.0")]
+        assert [s.value for s in speed] == [Decimal("1.8")]
+        # unknown sample type ("swolfScore") is silently skipped
+        assert len(ts_samples) == 3
+
+    def test_samples_persist_as_data_point_series(self, db: Session) -> None:
+        user = UserFactory()
+        service = ImportService(log=logging.getLogger("test"))
+
+        result = service.load_data(db, _payload(route=False), str(user.id))
+
+        assert result["records_saved"] == 3  # 2 HR + 1 speed; swolfScore dropped
+        hr_rows = _series_rows(db, SeriesType.heart_rate)
+        assert [row.value for row in hr_rows] == [Decimal("110.000"), Decimal("112.000")]
+        assert len(_series_rows(db, SeriesType.speed)) == 1
