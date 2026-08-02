@@ -16,6 +16,8 @@ from .sync_request import (
     SourceInfo,
     SyncRequest,
     SyncRequestData,
+    WorkoutRoutePoint,
+    WorkoutSample,
     WorkoutStatistic,
 )
 
@@ -34,6 +36,8 @@ __all__ = [
     "SyncRequest",
     "SyncRequestData",
     "SleepRecord",
+    "WorkoutRoutePoint",
+    "WorkoutSample",
     "WorkoutStatistic",
     "SourceInfo",
     "OSVersion",

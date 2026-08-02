@@ -105,6 +105,34 @@ class WorkoutStatistic(BaseModel):
     value: float | int
 
 
+class WorkoutRoutePoint(BaseModel):
+    """Single GPS point of a workout route.
+
+    Cross-plan contract with the mobile apps (iOS plan): field names/types here
+    define what the SDK must send. Matches the json_schema_extra example below.
+    """
+
+    timestamp: datetime
+    latitude: float
+    longitude: float
+    altitudeM: float | None = None
+    horizontalAccuracyM: float | None = None
+    verticalAccuracyM: float | None = None
+
+
+class WorkoutSample(BaseModel):
+    """Single in-workout time-series sample (heart rate, speed, cadence, power).
+
+    `type` uses the camelCase sample vocabulary ("heartRate", "speed", ...);
+    unmapped types are silently skipped by the importer.
+    """
+
+    timestamp: datetime
+    type: str
+    value: Decimal
+    unit: str | None = None
+
+
 class Workout(BaseModel):
     """Schema for workout/exercise session from HealthKit."""
 
@@ -118,12 +146,12 @@ class Workout(BaseModel):
     title: str | None = None
     notes: str | None = None
     values: list[WorkoutStatistic] | None = None
+    route: list[WorkoutRoutePoint] | None = None
+    samples: list[WorkoutSample] | None = None
 
     # everything below is unused for now
     segments: list[dict[str, Any]] | None = None
     laps: list[dict[str, Any]] | None = None
-    route: list[dict[str, Any]] | None = None
-    samples: list[dict[str, Any]] | None = None
     metadata: list[dict[str, Any]] | dict[str, Any] | None = None
 
 
