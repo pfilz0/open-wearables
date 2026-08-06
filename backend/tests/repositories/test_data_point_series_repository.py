@@ -902,3 +902,41 @@ class TestDataPointSeriesRepository:
         by_source = {r["source"]: r["steps_sum"] for r in result}
         assert by_source["garmin"] == 10000
         assert by_source["apple"] == 8000
+
+
+class TestCoordinatePrecision:
+    """`value` is one column shared by every series, latitude/longitude included."""
+
+    @pytest.fixture
+    def series_repo(self) -> DataPointSeriesRepository:
+        return DataPointSeriesRepository(DataPointSeries)
+
+    def test_gps_coordinate_survives_the_write(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        """Three decimals put a coordinate ~110 m from where it was recorded.
+
+        Latitude 52.229676 rounds to 52.230, which is far enough to make a stored
+        route useless as a route. Seven decimals is the usual GPS convention.
+        """
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user)
+        latitude = Decimal("52.2296760")
+
+        created = series_repo.create(
+            db,
+            TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user.id,
+                source="garmin",
+                device_model="Forerunner",
+                data_source_id=mapping.id,
+                recorded_at=datetime.now(timezone.utc),
+                value=latitude,
+                series_type=SeriesType.latitude,
+            ),
+        )
+        db.expire_all()
+
+        stored = db.query(DataPointSeries).filter(DataPointSeries.id == created.id).one()
+        assert stored.value == latitude
