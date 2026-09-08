@@ -13,6 +13,7 @@ from sqlalchemy import (
     Date,
     Interval,
     MetaData,
+    Select,
     String,
     Table,
     and_,
@@ -21,6 +22,7 @@ from sqlalchemy import (
     cast,
     func,
     literal_column,
+    select,
     text,
     tuple_,
 )
@@ -353,39 +355,37 @@ class DataPointSeriesRepository(
             source=creator.source,
         )
 
-    def get_samples(
+    def _sample_filters(
         self,
-        db_session: DbSession,
         params: TimeSeriesQueryParams,
         types: list[SeriesType],
         user_id: UUID,
-    ) -> tuple[list[tuple[DataPointSeries, DataSource]], int]:
-        """Get data points with filtering and keyset pagination.
+    ) -> list[ColumnElement[bool]]:
+        """Row filters shared by get_samples and winning_data_source_ids.
 
-        Returns a tuple of (samples, total_count) where total_count is calculated
-        BEFORE applying cursor pagination, giving the total number of matching records.
+        Both must see the same population, or the winning source could be picked from
+        a different set of rows than the one actually returned.
         """
-        query = (
-            db_session.query(self.model, DataSource)
-            .join(
-                DataSource,
-                self.model.data_source_id == DataSource.id,
-            )
-            .filter(DataSource.user_id == user_id)
-        )
+        filters: list[ColumnElement[bool]] = [DataSource.user_id == user_id]
 
         if types:
             type_ids = [get_series_type_id(t) for t in types]
-            query = query.filter(self.model.series_type_definition_id.in_(type_ids))
+            filters.append(self.model.series_type_definition_id.in_(type_ids))
+
+        if params.provider:
+            filters.append(DataSource.provider == params.provider)
+
+        if params.data_source_id:
+            filters.append(self.model.data_source_id == params.data_source_id)
 
         if params.device_model:
-            query = query.filter(DataSource.device_model == params.device_model)
+            filters.append(DataSource.device_model == params.device_model)
 
         if params.source:
-            query = query.filter(DataSource.source == params.source)
+            filters.append(DataSource.source == params.source)
 
         if params.start_datetime:
-            query = query.filter(self.model.recorded_at >= params.start_datetime)
+            filters.append(self.model.recorded_at >= params.start_datetime)
 
         if params.end_datetime:
             # If user didnt specify an hour, minute nor second, add 1 day to include the entire day
@@ -393,7 +393,83 @@ class DataPointSeriesRepository(
             # Check if the time part after the date is 00:00:00
             if end_dt.time() == time.min:
                 end_dt = end_dt + timedelta(days=1)
-            query = query.filter(self.model.recorded_at < end_dt)
+            filters.append(self.model.recorded_at < end_dt)
+
+        return filters
+
+    def winning_data_source_ids(
+        self,
+        params: TimeSeriesQueryParams,
+        types: list[SeriesType],
+        user_id: UUID,
+    ) -> Select[tuple[int, UUID]]:
+        """(series_type, data_source) pairs that win their series type for this window.
+
+        Sources are ranked by provider priority, then device-type priority, then
+        device_model as a stable tiebreaker (lower value = higher priority; a provider
+        or device type with no priority row sorts last, matching PriorityService).
+        DISTINCT ON keeps exactly one source per series type, so two watches worn on
+        the same run never blend into one series.
+
+        Selection is per series type, not per request: a watch that recorded heart rate
+        but no GPS loses only the GPS series, and the next-best source supplies it.
+
+        Returned unexecuted so the caller can inline it as an IN (...), keeping
+        selection and keyset pagination in one statement.
+        """
+        return (
+            select(self.model.series_type_definition_id, self.model.data_source_id)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .outerjoin(ProviderPriority, DataSource.provider == ProviderPriority.provider)
+            .outerjoin(
+                DeviceTypePriority,
+                # data_source.device_type holds the enum *value* ("watch"), while
+                # device_type_priority.device_type is a Postgres enum whose labels are the
+                # member *names* ("WATCH"). Compared raw they never match, which would
+                # leave the device-type tiebreaker silently inert.
+                DataSource.device_type == func.lower(cast(DeviceTypePriority.device_type, String)),
+            )
+            .where(*self._sample_filters(params, types, user_id))
+            .distinct(self.model.series_type_definition_id)
+            .order_by(
+                self.model.series_type_definition_id,
+                ProviderPriority.priority.asc().nulls_last(),
+                DeviceTypePriority.priority.asc().nulls_last(),
+                DataSource.device_model.asc().nulls_last(),
+            )
+        )
+
+    def get_samples(
+        self,
+        db_session: DbSession,
+        params: TimeSeriesQueryParams,
+        types: list[SeriesType],
+        user_id: UUID,
+        filter_by_priority: bool = False,
+    ) -> tuple[list[tuple[DataPointSeries, DataSource]], int]:
+        """Get data points with filtering and keyset pagination.
+
+        Returns a tuple of (samples, total_count) where total_count is calculated
+        BEFORE applying cursor pagination, giving the total number of matching records.
+
+        When filter_by_priority is set, only the highest-priority source's samples are
+        returned per series type - the same ranking summaries and sleep sessions use.
+        """
+        query = (
+            db_session.query(self.model, DataSource)
+            .join(
+                DataSource,
+                self.model.data_source_id == DataSource.id,
+            )
+            .filter(*self._sample_filters(params, types, user_id))
+        )
+
+        if filter_by_priority:
+            query = query.filter(
+                tuple_(self.model.series_type_definition_id, self.model.data_source_id).in_(
+                    self.winning_data_source_ids(params, types, user_id)
+                )
+            )
 
         # Calculate total count BEFORE applying cursor pagination
         # This gives us the total matching records (after all other filters)

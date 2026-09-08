@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.schemas.enums import SeriesType
+from app.schemas.enums import ProviderName, SeriesType
 from app.utils.dates import ZoneOffset
 
 
@@ -62,6 +62,10 @@ class TimeSeriesQueryParams(BaseModel):
 
     start_datetime: datetime | None = Field(None, description="Lower bound (inclusive) for recorded timestamp")
     end_datetime: datetime | None = Field(None, description="Upper bound (inclusive) for recorded timestamp")
+    provider: ProviderName | None = Field(
+        None,
+        description="Only return samples from this provider (e.g. garmin, apple).",
+    )
     device_model: str | None = Field(
         None,
         description="Device model filter",
